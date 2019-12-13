@@ -29,21 +29,32 @@ import com.esri.ges.core.property.PropertyException;
 import com.esri.ges.core.property.PropertyType;
 import com.esri.ges.framework.i18n.BundleLogger;
 import com.esri.ges.framework.i18n.BundleLoggerFactory;
-import com.esri.ges.transport.TransportDefinitionBase;
 import com.esri.ges.transport.TransportType;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 
-public class KafkaInboundTransportDefinition extends TransportDefinitionBase {
+public class KafkaInboundTransportDefinition extends KafkaTransportDefinitionBase {
   private static final BundleLogger	LOGGER	= BundleLoggerFactory.getLogger(KafkaInboundTransportDefinition.class);
 
-  public KafkaInboundTransportDefinition()
+  KafkaInboundTransportDefinition()
   {
     super(TransportType.INBOUND);
     try
     {
-      propertyDefinitions.put("zkConnect", new PropertyDefinition("zkConnect", PropertyType.String, "localhost:2181", "${com.esri.geoevent.transport.kafka-transport.ZKCONNECT_LBL}", "${com.esri.geoevent.transport.kafka-transport.ZKCONNECT_DESC}", true, false));
-      propertyDefinitions.put("numThreads", new PropertyDefinition("numThreads", PropertyType.Integer, "1", "${com.esri.geoevent.transport.kafka-transport.NUM_THREADS_LBL}", "${com.esri.geoevent.transport.kafka-transport.NUM_THREADS_DESC}", true, false));
-      propertyDefinitions.put("topic", new PropertyDefinition("topic", PropertyType.String, "", "${com.esri.geoevent.transport.kafka-transport.TOPIC_LBL}", "${com.esri.geoevent.transport.kafka-transport.TOPIC_DESC}", true, false));
-      propertyDefinitions.put("groupId", new PropertyDefinition("groupId", PropertyType.String, "", "${com.esri.geoevent.transport.kafka-transport.GROUOP_ID_LBL}", "${com.esri.geoevent.transport.kafka-transport.GROUOP_ID_DESC}", true, false));
+      propertyDefinitions.put("numThreads", new PropertyDefinition("numThreads",
+          PropertyType.Integer,
+          "1",
+          "${com.esri.geoevent.transport.kafka-advanced-transport.NUM_THREADS_LBL}",
+          "${com.esri.geoevent.transport.kafka-advanced-transport.NUM_THREADS_DESC}",
+          true,
+          false));
+
+      propertyDefinitions.put("groupId", new PropertyDefinition("groupId",
+          PropertyType.String,
+          "",
+          "${com.esri.geoevent.transport.kafka-advanced-transport.GROUP_ID_LBL}",
+          "${com.esri.geoevent.transport.kafka-advanced-transport.GROUP_ID_DESC}",
+          false,
+          false));
     }
     catch (PropertyException e)
     {
@@ -54,32 +65,20 @@ public class KafkaInboundTransportDefinition extends TransportDefinitionBase {
   }
 
   @Override
-  public String getName()
-  {
-    return "Kafka";
-  }
-
-  @Override
   public String getDomain()
   {
     return "com.esri.geoevent.transport.inbound";
   }
 
   @Override
-  public String getVersion()
-  {
-    return "10.5.0";
-  }
-
-  @Override
   public String getLabel()
   {
-    return "${com.esri.geoevent.transport.kafka-transport.IN_LABEL}";
+    return "${com.esri.geoevent.transport.kafka-advanced-transport.IN_LABEL}";
   }
 
   @Override
   public String getDescription()
   {
-    return "${com.esri.geoevent.transport.kafka-transport.IN_DESC}";
+    return "${com.esri.geoevent.transport.kafka-advanced-transport.IN_DESC}";
   }
 }

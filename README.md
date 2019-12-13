@@ -4,9 +4,18 @@ ArcGIS GeoEvent Server sample Kafka connectors for connecting to Kafka message s
 
 ![App](kafka-for-geoevent.png?raw=true)
 
+## Changes in this Fork
+
+This branch provides additional capabilities:
+- Upgrade to the new Kafka consumer API and kafka-clients 2.3.1. A Zookeeper connection is no longer required.
+- You can specify custom Kafka configuration parameters like `compression.type`, `linger.ms` and TLS settings. 
+- The names and versions have been changed to reflect a difference from the upstream code.
+
+*This code is provided under the Apache 2.0 license and is not officially maintained or supported by the Esri GeoEvent team.*
+
 ## Features
-* Kafka Inbound Transport
-* Kafka Outbound Transport
+* Kafka Advanced Inbound Transport
+* Kafka Advanced Outbound Transport
 
 ## Instructions
 
@@ -42,7 +51,7 @@ Find a bug or want to request a new feature?  Please let us know by submitting a
 Esri welcomes contributions from anyone and everyone. Please see our [guidelines for contributing](https://github.com/esri/contributing).
 
 ## Licensing
-Copyright 2015 Esri
+Copyright 2019 Esri
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

@@ -29,8 +29,10 @@ import com.esri.ges.core.component.RunningException;
 import com.esri.ges.core.component.RunningState;
 import com.esri.ges.core.geoevent.GeoEvent;
 import com.esri.ges.core.validation.ValidationException;
+import com.esri.ges.datastore.folder.FolderDataStore;
 import com.esri.ges.framework.i18n.BundleLogger;
 import com.esri.ges.framework.i18n.BundleLoggerFactory;
+import com.esri.ges.manager.datastore.folder.FolderDataStoreManager;
 import com.esri.ges.messaging.EventDestination;
 import com.esri.ges.messaging.MessagingException;
 import com.esri.ges.transport.GeoEventAwareTransport;
@@ -40,19 +42,29 @@ import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.clients.producer.RecordMetadata;
 
+import java.io.*;
 import java.nio.ByteBuffer;
+import java.util.Properties;
 
 class KafkaOutboundTransport extends OutboundTransportBase implements GeoEventAwareTransport {
-  private static final BundleLogger LOGGER	= BundleLoggerFactory.getLogger(KafkaOutboundTransport.class);
-  private KafkaEventProducer producer;
-  private String bootstrap = "localhost:9092";
-  private String topic;
-  private String partitionKeyTag;
 
-  KafkaOutboundTransport(TransportDefinition definition) throws ComponentException {
+  private static final BundleLogger LOGGER	= BundleLoggerFactory.getLogger(KafkaOutboundTransport.class);
+  private static final String CLIENT_ID = "kafka-for-geoevent";
+  private final FolderDataStoreManager folderDataStoreManager;
+
+  private String bootstrapServers = "";
+  private String topic = "";
+  private String advancedConfigs = "";
+
+  private String partitionKeyTag = "";
+
+  private KafkaEventProducer producer;
+  private Properties advancedConfigProperties;
+
+  KafkaOutboundTransport(TransportDefinition definition, FolderDataStoreManager folderDataStoreManager) throws ComponentException {
     super(definition);
+    this.folderDataStoreManager = folderDataStoreManager;
   }
 
   @Override
@@ -64,10 +76,6 @@ class KafkaOutboundTransport extends OutboundTransportBase implements GeoEventAw
   public void receive(ByteBuffer byteBuffer, String channelId, GeoEvent geoEvent) {
     try {
       if (geoEvent != null) {
-        if (producer == null) {
-          producer = new KafkaEventProducer(new EventDestination(topic), bootstrap);
-        }
-
         Object partitionKey = null;
 
         if(partitionKeyTag != null && !partitionKeyTag.isEmpty())
@@ -118,20 +126,40 @@ class KafkaOutboundTransport extends OutboundTransportBase implements GeoEventAw
 
   @Override
   public void afterPropertiesSet() {
-    super.afterPropertiesSet();
-    shutdownProducer();
-    bootstrap = getProperty("bootstrap").getValueAsString();
-    topic = getProperty("topic").getValueAsString();
+
+    bootstrapServers = getProperty(KafkaTransportDefinitionBase.PROPERTY_BOOTSTRAP_SERVER).getValueAsString();
+    topic = getProperty(KafkaTransportDefinitionBase.PROPERTY_TOPIC).getValueAsString();
+    advancedConfigs = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS).getValueAsString();
+
+    final String advancedConfigsFolder = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS_FOLDER).getValueAsString();
+    final String advancedConfigsFileName = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS_FILE_NAME).getValueAsString();
+
+    if(!advancedConfigsFolder.isEmpty() &&
+        !advancedConfigsFileName.isEmpty()) {
+      FolderDataStore folderDataStore = folderDataStoreManager.getFolderDataStore(advancedConfigsFolder);
+      try (final InputStream inputStream =
+               new FileInputStream(new File(folderDataStore.getPath(), advancedConfigsFileName)))
+      {
+        final Properties properties = new Properties();
+        properties.load(inputStream);
+        this.advancedConfigProperties = properties;
+      } catch (IOException e) {
+        LOGGER.error(e.getMessage());
+      }
+    }
     partitionKeyTag = getProperty("partitionKeyTag").getValueAsString();
+
+    super.afterPropertiesSet();
   }
 
   @Override
   public void validate() throws ValidationException {
     super.validate();
-    if (bootstrap == null || bootstrap.isEmpty())
+    if (bootstrapServers.isEmpty())
       throw new ValidationException(LOGGER.translate("BOOTSTRAP_VALIDATE_ERROR"));
-    if (topic == null || topic.isEmpty())
+    if (topic.isEmpty())
       throw new ValidationException(LOGGER.translate("TOPIC_VALIDATE_ERROR"));
+    // TODO: Validate advanced configs
   }
 
   private synchronized void disconnect(String reason) {
@@ -146,7 +174,17 @@ class KafkaOutboundTransport extends OutboundTransportBase implements GeoEventAw
 
   private synchronized void connect() {
     disconnect("");
-    setRunningState(RunningState.STARTED);
+    setRunningState(RunningState.STARTING);
+    try {
+      producer = new KafkaEventProducer(new EventDestination(topic), new Properties(advancedConfigProperties), bootstrapServers);
+      producer.setup();
+      setRunningState(RunningState.STARTED);
+    }
+    catch(Exception ex) {
+      setRunningState(RunningState.ERROR);
+      setErrorMessage(ex.getMessage());
+      LOGGER.error(ex.getMessage());
+    }
   }
 
   private synchronized void shutdownProducer() {
@@ -162,85 +200,97 @@ class KafkaOutboundTransport extends OutboundTransportBase implements GeoEventAw
   }
 
   private class KafkaEventProducer extends KafkaComponentBase {
-    private KafkaProducer<byte[], byte[]> producer;
+    private KafkaProducer<String, ByteBuffer> producer;
 
-    private final Callback completionCallback = new Callback() {
-      @Override
-      public void onCompletion(RecordMetadata metadata, Exception e) {
-        if (e != null)
-        {
-          final String errorMsg = LOGGER.translate("KAFKA_SEND_FAILURE_ERROR", destination.getName(), e.getMessage());
-          LOGGER.error(errorMsg);
-          // offset = metadata.offset();
-          return;
-        }
+    private final Callback completionCallback = (metadata, e) -> {
+      if (e != null)
+      {
+        final String errorMsg = LOGGER.translate("KAFKA_SEND_FAILURE_ERROR",
+            metadata.topic(),
+            metadata.partition(),
+            metadata.offset(),
+            e.getMessage());
 
-        if(LOGGER.isDebugEnabled())
-        {
-          final String debugMsg = LOGGER.translate("KAFKA_SENT_RECORD_DEBUG",
-                  metadata.topic(),
-                  metadata.partition(),
-                  metadata.offset(),
-                  metadata.serializedKeySize(),
-                  metadata.serializedValueSize());
-          LOGGER.debug(debugMsg);
-        }
+        LOGGER.error(errorMsg);
+        // offset = metadata.offset();
+        return;
+      }
+
+      if(LOGGER.isDebugEnabled())
+      {
+        final String debugMsg = LOGGER.translate("KAFKA_SENT_RECORD_DEBUG",
+                metadata.topic(),
+                metadata.partition(),
+                metadata.offset(),
+                metadata.serializedKeySize(),
+                metadata.serializedValueSize());
+        LOGGER.debug(debugMsg);
       }
     };
 
-    KafkaEventProducer(EventDestination destination, String bootstrap) {
-      super(destination);
+    KafkaEventProducer(EventDestination destination, Properties properties, String bootstrap) {
+      super(destination, properties);
+
       // http://kafka.apache.org/documentation.html#producerconfigs
       props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrap);
-      props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
-      props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.ByteArraySerializer");
-      props.put(ProducerConfig.CLIENT_ID_CONFIG, "kafka-for-geoevent");
-      // props.put("partitioner.class", "kafka.producer.DefaultPartitioner");
-      // props.put(ProducerConfig.ACKS_CONFIG, "0");
-      // props.put(ProducerConfig.RECONNECT_BACKOFF_MS_CONFIG, "0");
-      // props.put(ProducerConfig.RETRY_BACKOFF_MS_CONFIG, "0");
-      // props.put(ProducerConfig.RETRIES_CONFIG, "0");
+      props.put(ProducerConfig.CLIENT_ID_CONFIG, CLIENT_ID);
+
       try {
-        setup();
+        if(advancedConfigs != null && !advancedConfigs.isEmpty()) {
+          props.load(new StringReader(advancedConfigs));
+        }
+      } catch (IOException e) {
+        LOGGER.error(e.getMessage());
+        e.printStackTrace();
       }
-      catch (MessagingException e) {
-        setDisconnected(e);
-      }
+
+      // These two properties must override any custom properties
+      props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, org.apache.kafka.common.serialization.StringSerializer.class.getName());
+      props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, org.apache.kafka.common.serialization.ByteBufferSerializer.class.getName());
+
+      LOGGER.info(props.toString());
     }
 
     @Override
     public synchronized void init() throws MessagingException {
       if (producer == null) {
-        Thread.currentThread().setContextClassLoader(null); // see http://stackoverflow.com/questions/34734907/karaf-kafka-osgi-bundle-producer-issue for details
-        producer = new KafkaProducer<byte[], byte[]>(props);
+        try {
+          Thread.currentThread().setContextClassLoader(null); // see http://stackoverflow.com/questions/34734907/karaf-kafka-osgi-bundle-producer-issue for details
+          producer = new KafkaProducer<>(props);
+        }
+        catch(Exception ex) {
+          throw new MessagingException(ex.getMessage());
+        }
       }
     }
 
-    void send(final ByteBuffer bb, Object partitionKey) throws MessagingException {
-      // wait to send messages if we are not connected
-      if (isConnected()) {
-        final ProducerRecord<byte[], byte[]> record;
+    @Override
+    protected void setConnected() {
+      super.setConnected();
+      setRunningState(RunningState.STARTED);
+    }
 
-        if (partitionKey != null) {
-          // TODO: Support serializing based on key data type instead of using hashcode (e.g. StringSerializer for Strings)
-          final int h = partitionKey.hashCode();
-          final byte[] key = new byte[]{
-                  (byte) (h >>> 24),
-                  (byte) (h >>> 16),
-                  (byte) (h >>> 8),
-                  (byte) h
-          };
-          record = new ProducerRecord<byte[], byte[]>(
-                  destination.getName(),
-                  key,
-                  bb.array());
-        } else {
-          record = new ProducerRecord<byte[], byte[]>(
-                  destination.getName(),
-                  bb.array());
+    public void send(final ByteBuffer bb, Object partitionKey) throws MessagingException {
+      try {
+        // wait to send messages if we are not connected
+        if (isConnected()) {
+          final ProducerRecord<String, ByteBuffer> record;
+
+          if (partitionKey != null) {
+            record = new ProducerRecord<>(
+                destination.getName(),
+                partitionKey.toString(),
+                bb);
+          } else {
+            record = new ProducerRecord<>(
+                destination.getName(),
+                bb);
+          }
+
+          producer.send(record, completionCallback);
         }
-
-        producer.send(record, completionCallback);
+      } catch(Exception ex) {
+        LOGGER.error(ex.getMessage());
       }
     }
 

@@ -30,16 +30,21 @@ import java.util.Observable;
 import java.util.Properties;
 
 abstract class KafkaComponentBase extends Observable implements EventDestinationAwareComponent {
-  EventDestination destination;
   private volatile boolean connected = false;
   private String details = "";
   private int timeout = 10000;
-  Properties props = new Properties();
+
+  final EventDestination destination;
+  final Properties props;
 
   KafkaComponentBase(EventDestination destination) {
-    this.destination = destination;
-  }
+    this(destination, new Properties());
+  };
 
+  KafkaComponentBase(EventDestination destination, Properties properties) {
+    this.destination = destination;
+    this.props = properties;
+  }
   @Override
   public EventDestination getEventDestination() {
     return destination;
@@ -68,9 +73,14 @@ abstract class KafkaComponentBase extends Observable implements EventDestination
 
   @Override
   public synchronized void setup() throws MessagingException {
-    disconnect();
-    init();
-    setConnected();
+    try {
+      disconnect();
+      init();
+      setConnected();
+    }
+    catch(Exception ex) {
+      throw new MessagingException(ex.getMessage());
+    }
   }
 
   @Override
