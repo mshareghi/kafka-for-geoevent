@@ -31,23 +31,23 @@ import com.esri.ges.framework.i18n.BundleLogger;
 import com.esri.ges.framework.i18n.BundleLoggerFactory;
 import com.esri.ges.transport.TransportDefinitionBase;
 import com.esri.ges.transport.TransportType;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.ProducerConfig;
 
-class KafkaOutboundTransportDefinition extends TransportDefinitionBase {
+class KafkaOutboundTransportDefinition extends KafkaTransportDefinitionBase {
   private static final BundleLogger LOGGER	= BundleLoggerFactory.getLogger(KafkaOutboundTransportDefinition.class);
 
   KafkaOutboundTransportDefinition() {
     super(TransportType.OUTBOUND);
     try {
-        propertyDefinitions.put("bootstrap", new PropertyDefinition("bootstrap", PropertyType.String, "localhost:9092", "${com.esri.geoevent.transport.kafka-transport.BOOTSTRAP_LBL}", "${com.esri.geoevent.transport.kafka-transport.BOOTSTRAP_DESC}", true, false));
-        propertyDefinitions.put("topic", new PropertyDefinition("topic", PropertyType.String, "", "${com.esri.geoevent.transport.kafka-transport.TOPIC_LBL}", "${com.esri.geoevent.transport.kafka-transport.TOPIC_DESC}", true, false));
-        propertyDefinitions.put("partitionKeyTag",
-            new PropertyDefinition(
-                "partitionKeyTag",
-                PropertyType.String,"",
-                "${com.esri.geoevent.transport.kafka-transport.PARTITION_KEY_TAG_LBL}",
-                "${com.esri.geoevent.transport.kafka-transport.PARTITION_KEY_TAG_DESC}",
-                false,
-                false));
+      propertyDefinitions.put("partitionKeyTag",
+          new PropertyDefinition(
+              "partitionKeyTag",
+              PropertyType.String,"TRACK_ID",
+              "${com.esri.geoevent.transport.kafka-advanced-transport.PARTITION_KEY_TAG_LBL}",
+              "${com.esri.geoevent.transport.kafka-advanced-transport.PARTITION_KEY_TAG_DESC}",
+              false,
+              false));
     }
     catch (PropertyException e)
     {
@@ -58,32 +58,20 @@ class KafkaOutboundTransportDefinition extends TransportDefinitionBase {
   }
 
   @Override
-  public String getName()
-  {
-    return "Kafka";
-  }
-
-  @Override
   public String getDomain()
   {
     return "com.esri.geoevent.transport.outbound";
   }
 
   @Override
-  public String getVersion()
-  {
-    return "10.5.0";
-  }
-
-  @Override
   public String getLabel()
   {
-    return "${com.esri.geoevent.transport.kafka-transport.OUT_LABEL}";
+    return "${com.esri.geoevent.transport.kafka-advanced-transport.OUT_LABEL}";
   }
 
   @Override
   public String getDescription()
   {
-    return "${com.esri.geoevent.transport.kafka-transport.OUT_DESC}";
+    return "${com.esri.geoevent.transport.kafka-advanced-transport.OUT_DESC}";
   }
 }

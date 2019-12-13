@@ -27,111 +27,238 @@ package com.esri.geoevent.transport.kafka;
 import com.esri.ges.core.component.ComponentException;
 import com.esri.ges.core.component.RunningException;
 import com.esri.ges.core.component.RunningState;
+import com.esri.ges.core.property.PropertyException;
 import com.esri.ges.core.validation.ValidationException;
+import com.esri.ges.datastore.folder.FolderDataStore;
 import com.esri.ges.framework.i18n.BundleLogger;
 import com.esri.ges.framework.i18n.BundleLoggerFactory;
-import com.esri.ges.messaging.EventDestination;
-import com.esri.ges.messaging.MessagingException;
+import com.esri.ges.manager.datastore.folder.FolderDataStoreManager;
 import com.esri.ges.transport.InboundTransportBase;
 import com.esri.ges.transport.TransportDefinition;
 import com.esri.ges.util.Converter;
-import kafka.admin.AdminUtils;
-import kafka.consumer.Consumer;
-import kafka.consumer.ConsumerConfig;
-import kafka.consumer.ConsumerIterator;
-import kafka.consumer.KafkaStream;
-import kafka.javaapi.consumer.ConsumerConnector;
-import kafka.utils.ZKStringSerializer$;
-import kafka.utils.ZkUtils;
-import org.I0Itec.zkclient.ZkClient;
-import org.I0Itec.zkclient.ZkConnection;
+import org.apache.kafka.clients.ClientDnsLookup;
+import org.apache.kafka.clients.ClientUtils;
+import org.apache.kafka.clients.consumer.*;
+import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.config.ConfigException;
+import org.apache.kafka.common.errors.WakeupException;
 
+import java.io.*;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Properties;
-import java.util.concurrent.*;
+import java.time.Duration;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
-class KafkaInboundTransport extends InboundTransportBase implements Runnable {
+class KafkaInboundTransport extends InboundTransportBase {
   private static final BundleLogger LOGGER = BundleLoggerFactory.getLogger(KafkaInboundTransport.class);
-  private KafkaEventConsumer consumer;
-  private ConsumerConfig consumerConfig;
-  private String zkConnect;
-  private int numThreads;
-  private String topic;
-  private String groupId;
+  private static final String CLIENT_ID = "kafka-for-geoevent";
+  private static final Duration CONSUMER_MAX_POLL_TIME = Duration.ofMillis(Long.MAX_VALUE);
+  private final FolderDataStoreManager folderDataStoreManager;
 
-  KafkaInboundTransport(TransportDefinition definition) throws ComponentException {
+  private ExecutorService executorService;
+
+  private String bootstrapServers = "";
+  private String topic = "";
+  private String advancedConfigs = "";
+
+  private String groupId = "";
+  private int numThreads = 1;
+
+  private List<KafkaConsumerLoop> consumers = new ArrayList<>();
+  private Properties advancedConfigProperties;
+
+  KafkaInboundTransport(TransportDefinition definition, FolderDataStoreManager folderDataStoreManager) throws ComponentException {
     super(definition);
+    this.folderDataStoreManager = folderDataStoreManager;
   }
 
   public boolean isClusterable() {
     return true;
   }
 
-  @Override
-  public void run()
+  private class KafkaConsumerLoop implements Runnable
   {
-    setErrorMessage("");
-    setRunningState(RunningState.STARTED);
-    while (isRunning())
+    private final KafkaConsumer<String, ByteBuffer> consumer;
+
+    private final List<String> topics;
+    private final String clientId;
+    private final int id;
+
+    private CountDownLatch shutdownLatch = new CountDownLatch(1);
+
+    private final ConsumerRebalanceListener listener;
+
+    KafkaConsumerLoop(int id, List<String> topics, Properties configs) {
+      this.id = id;
+      this.consumer = new KafkaConsumer<>(configs);
+      this.clientId = configs.getProperty(ConsumerConfig.CLIENT_ID_CONFIG);
+      this.topics = topics;
+
+      this.listener = new ConsumerRebalanceListener() {
+        @Override
+        public void onPartitionsRevoked(Collection<TopicPartition> partitions) {
+          LOGGER.info(String.format("Consumer [ %s | %d ]- Revoked partitions : %s", clientId, id, partitions));
+        }
+
+        @Override
+        public void onPartitionsAssigned(Collection<TopicPartition> partitions) {
+          LOGGER.info(String.format("Consumer [ %s | %d ] - Assigned partitions : %s", clientId, id, partitions));
+        }
+      };
+    }
+
+    @Override
+    public void run()
     {
       try
       {
-        byte[] bytes = consumer.receive();
-        if (bytes != null && bytes.length > 0) {
-          ByteBuffer bb = ByteBuffer.allocate(bytes.length);
-          bb.put(bytes);
-          bb.flip();
-          byteListener.receive(bb, "");
-          bb.clear();
+        LOGGER.info(String.format("Starting Consumer [ %s | %d ]", clientId, id));
+
+        this.consumer.subscribe(topics, listener);
+
+        if(LOGGER.isDebugEnabled())
+        {
+          LOGGER.debug(String.format("Consumer [ %s | %d ] - Subscribed to topic(s): %s", clientId, id, topics));
         }
+
+        while (isRunning())
+        {
+          final ConsumerRecords<String, ByteBuffer> records = consumer.poll(CONSUMER_MAX_POLL_TIME);
+
+          if(records.isEmpty()) {
+            continue;
+          }
+
+          if(LOGGER.isDebugEnabled())
+          {
+            LOGGER.debug(String.format("Consumer [ %s | %d ] - Processing a batch of %d records.",
+                clientId,
+                id,
+                records.count()));
+          }
+
+          for (ConsumerRecord<String, ByteBuffer> record : records)
+          {
+            final String key = record.key();
+            final String partitionKey = (key == null) ? null : String.valueOf(record.partition());
+            byteListener.receive(record.value(), partitionKey);
+          }
+
+          if(LOGGER.isDebugEnabled())
+          {
+            LOGGER.debug(String.format("Consumer [ %s | %d ] - Finished processing batch of %d records.",
+                clientId,
+                id,
+                records.count()));
+          }
+        }
+
       }
-      catch (MessagingException e)
-      {
-        LOGGER.error("", e);
+      catch(WakeupException ex) {
+        if(LOGGER.isTraceEnabled()) {
+          LOGGER.trace(ex.getMessage());
+        }
+        // Ignore
+      }
+      catch(Exception ex) {
+        LOGGER.error(ex.getMessage());
+      }
+      finally{
+        LOGGER.info(String.format("Shutting down Consumer [ %s ] - Thread %d", clientId, id));
+        consumer.close();
+        shutdownLatch.countDown();
+        LOGGER.info(String.format("Shut down Consumer [ %s ] - Thread %d", clientId, id));
+      }
+    }
+
+    void shutdown(){
+      try {
+        consumer.wakeup();
+        shutdownLatch.await();
+      } catch (InterruptedException e) {
+        LOGGER.error(e.getMessage());
       }
     }
   }
 
   @Override
   public void afterPropertiesSet() {
-    zkConnect = getProperty("zkConnect").getValueAsString();
-    numThreads = Converter.convertToInteger(getProperty("numThreads").getValueAsString(), 1);
-    topic = getProperty("topic").getValueAsString();
+    bootstrapServers = getProperty(KafkaTransportDefinitionBase.PROPERTY_BOOTSTRAP_SERVER).getValueAsString();
+    topic = getProperty(KafkaTransportDefinitionBase.PROPERTY_TOPIC).getValueAsString();
+    advancedConfigs = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS).getValueAsString();
     groupId = getProperty("groupId").getValueAsString();
+    if(groupId.isEmpty()) {
+      try {
+        groupId = String.valueOf(UUID.randomUUID());
+        setProperty("groupId", groupId);
+      } catch (PropertyException e) {
+        LOGGER.error(e.getMessage());
+      }
+    }
+    numThreads = Converter.convertToInteger(getProperty("numThreads").getValueAsString(), 1);
+
+    final String advancedConfigsFolder = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS_FOLDER).getValueAsString();
+    final String advancedConfigsFileName = getProperty(KafkaTransportDefinitionBase.PROPERTY_ADVANCED_CONFIGS_FILE_NAME).getValueAsString();
+
+    final Properties properties = new Properties();
+    this.advancedConfigProperties = properties;
+
+    if(!advancedConfigsFolder.isEmpty() &&
+        !advancedConfigsFileName.isEmpty()) {
+      FolderDataStore folderDataStore = folderDataStoreManager.getFolderDataStore(advancedConfigsFolder);
+      try (final InputStream inputStream =
+               new FileInputStream(new File(folderDataStore.getPath(), advancedConfigsFileName)))
+      {
+        properties.load(inputStream);
+      } catch (IOException e) {
+        LOGGER.error(e.getMessage());
+      }
+    }
+
+    if(!advancedConfigs.isEmpty()) {
+      try {
+        properties.load(new StringReader(advancedConfigs));
+      } catch(IOException ioe) {
+        LOGGER.warn(ioe.getMessage());
+      }
+    }
+
     super.afterPropertiesSet();
   }
 
   @Override
-  public void validate() throws ValidationException {
+  public void validate() throws ValidationException
+  {
     super.validate();
-    if (zkConnect.isEmpty())
-      throw new ValidationException(LOGGER.translate("ZKCONNECT_VALIDATE_ERROR"));
+    if (bootstrapServers == null || bootstrapServers.isEmpty())
+      throw new ValidationException(LOGGER.translate("BOOTSTRAP_VALIDATE_ERROR"));
+
+    try {
+      ClientUtils.parseAndValidateAddresses(
+          Arrays.asList(bootstrapServers.split(",")),
+          ClientDnsLookup.DEFAULT);
+    }
+    catch (ConfigException ex) {
+      throw new ValidationException(LOGGER.translate("BOOTSTRAP_VALIDATE_ERROR"));
+    }
+
     if (topic.isEmpty())
       throw new ValidationException(LOGGER.translate("TOPIC_VALIDATE_ERROR"));
+
     if (groupId.isEmpty())
       throw new ValidationException(LOGGER.translate("GROUP_ID_VALIDATE_ERROR"));
+
     if (numThreads < 1)
       throw new ValidationException(LOGGER.translate("NUM_THREADS_VALIDATE_ERROR"));
-    ZkClient zkClient = new ZkClient(zkConnect, 10000, 8000, ZKStringSerializer$.MODULE$);
-    // Security for Kafka was added in Kafka 0.9.0.0 -> isSecureKafkaCluster = false
-    ZkUtils zkUtils = new ZkUtils(zkClient, new ZkConnection(zkConnect), false);
-    Boolean topicExists = AdminUtils.topicExists(zkUtils, topic);
-    zkClient.close();
-    if (!topicExists)
-      throw new ValidationException(LOGGER.translate("TOPIC_VALIDATE_ERROR"));
-    // Init Consumer Config
-    Properties props = new Properties()
-    {
-      { put("zookeeper.connect", zkConnect); }
-      { put("group.id", groupId); }
-      { put("zookeeper.session.timeout.ms", "400"); }
-      { put("zookeeper.sync.time.ms", "200"); }
-      { put("auto.commit.interval.ms", "1000"); }
-    };
-    consumerConfig = new ConsumerConfig(props);
+
+    try {
+      new Properties().load(new StringReader(advancedConfigs));
+    } catch (IOException e) {
+      throw new ValidationException("Advanced configuration is invalid.");
+    }
+
   }
 
   @Override
@@ -148,7 +275,9 @@ class KafkaInboundTransport extends InboundTransportBase implements Runnable {
   @Override
   public synchronized void stop()
   {
+    setRunningState(RunningState.STOPPING);
     disconnect("");
+    setRunningState(RunningState.STOPPED);
   }
 
   private synchronized void disconnect(String reason)
@@ -156,9 +285,15 @@ class KafkaInboundTransport extends InboundTransportBase implements Runnable {
     if (!RunningState.STOPPED.equals(getRunningState()))
     {
       setRunningState(RunningState.STOPPING);
-      shutdownConsumer();
-      setErrorMessage(reason);
-      setRunningState(RunningState.STOPPED);
+      try {
+        shutdownConsumers();
+        setRunningState(RunningState.STOPPED);
+      }
+      catch(Exception ex) {
+        LOGGER.error(ex.getMessage());
+        setRunningState(RunningState.ERROR);
+        setErrorMessage(ex.getMessage());
+      }
     }
   }
 
@@ -166,189 +301,55 @@ class KafkaInboundTransport extends InboundTransportBase implements Runnable {
   {
     disconnect("");
     setRunningState(RunningState.STARTING);
-    if (consumer == null)
-      consumer = new KafkaEventConsumer();
-    if (consumer.getStatusDetails().isEmpty()) // no errors reported while instantiating a consumer
-    {
-      consumer.setConnected();
-      new Thread(this).start();
+
+    // see http://stackoverflow.com/questions/34734907/karaf-kafka-osgi-bundle-producer-issue for details
+    Thread.currentThread().setContextClassLoader(null);
+    try {
+      final Properties props = new Properties(advancedConfigProperties);
+
+      props.put(ConsumerConfig.CLIENT_ID_CONFIG, CLIENT_ID);
+      props.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+      props.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+
+      try {
+        props.load(new StringReader(advancedConfigs));
+      } catch (IOException e) {
+        LOGGER.error(e.getMessage());
+      }
+
+      // These two properties must override any custom properties
+      props.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, org.apache.kafka.common.serialization.StringDeserializer.class.getName());
+      props.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, org.apache.kafka.common.serialization.ByteBufferDeserializer.class.getName());
+
+      final List<String> topicList = Arrays.asList(this.topic.split(",")); // account for multiple topics
+
+      executorService = Executors.newFixedThreadPool(numThreads);
+
+      LOGGER.info(props.toString());
+
+      for (int i = 0; i < numThreads; i++) {
+        final KafkaConsumerLoop consumer = new KafkaConsumerLoop(i, topicList, props);
+        consumers.add(consumer);
+        executorService.submit(consumer);
+      }
+
+      setRunningState(RunningState.STARTED);
     }
-    else
-    {
+    catch (Exception ex){
       setRunningState(RunningState.ERROR);
-      setErrorMessage(consumer.getStatusDetails());
+      setErrorMessage(ex.getMessage());
     }
   }
 
-  private synchronized void shutdownConsumer() {
-    if (consumer != null) {
-      consumer.setDisconnected(null);
+  private void shutdownConsumers() throws InterruptedException {
+    for(KafkaConsumerLoop consumer : consumers) {
       consumer.shutdown();
-      consumer = null;
     }
   }
 
   public void shutdown() {
-    shutdownConsumer();
     super.shutdown();
-  }
-
-  private class KafkaEventConsumer extends KafkaComponentBase {
-    private Semaphore connectionLock;
-    private final BlockingQueue<byte[]> queue = new LinkedBlockingQueue<byte[]>();
-    private ConsumerConnector consumer;
-    private ExecutorService executor;
-
-    KafkaEventConsumer() {
-      super(new EventDestination(topic));
-      connectionLock = new Semaphore(2);
-      Map<String, Integer> topicCountMap =
-          new HashMap<String,Integer>()
-          {
-            {
-              put(topic, new Integer(numThreads));
-            }
-          };
-      consumer = Consumer.createJavaConsumerConnector(consumerConfig);
-      try
-      {
-        Map<String, List<KafkaStream<byte[], byte[]>>> consumerMap = consumer.createMessageStreams(topicCountMap);
-        List<KafkaStream<byte[], byte[]>> streams = consumerMap.get(topic);
-        executor = Executors.newFixedThreadPool(numThreads);
-        int threadNumber = 0;
-        for (final KafkaStream stream : streams)
-        {
-          try
-          {
-            executor.execute(new KafkaQueueingConsumer(stream, threadNumber++));
-          }
-          catch (Throwable th)
-          {
-            System.out.println(th.getMessage());
-            setDisconnected(th);
-          }
-        }
-      }
-      catch (Throwable th)
-      {
-        setDisconnected(th);
-        setErrorMessage(th.getMessage());
-      }
-    }
-
-    public synchronized void init() throws MessagingException
-    {
-      ;
-    }
-
-    byte[] receive() throws MessagingException {
-      // wait to receive messages if we are not connected
-      if (!isConnected())
-      {
-        try
-        {
-          connectionLock.acquire(); // blocks execution until a connection has been recovered
-        }
-        catch (InterruptedException error)
-        {
-          ; // ignored
-        }
-      }
-      byte[] bytes = null;
-      try
-      {
-        bytes = queue.poll(100, TimeUnit.MILLISECONDS);
-      }
-      catch (Exception e)
-      {
-        ; // ignore
-      }
-      return bytes;
-    }
-
-    @Override
-    protected void setConnected() {
-      if (connectionLock.availablePermits() == 0)
-        connectionLock.release();
-      super.setConnected();
-    }
-
-    @Override
-    protected void setDisconnected(Throwable th) {
-      if (connectionLock.availablePermits() == 2)
-        connectionLock.drainPermits();
-      super.setDisconnected(th);
-    }
-
-    public synchronized void shutdown() {
-      disconnect();
-      super.shutdown();
-    }
-
-    @Override
-    public synchronized void disconnect()
-    {
-      if (consumer != null)
-      {
-        consumer.shutdown();
-        consumer = null;
-      }
-      if (executor != null)
-      {
-        executor.shutdown();
-        try
-        {
-          if (!executor.awaitTermination(5000, TimeUnit.MILLISECONDS))
-            LOGGER.info("Timed out waiting for Kafka event consumer threads to shut down, exiting uncleanly");
-        }
-        catch (InterruptedException e)
-        {
-          LOGGER.error("Interrupted during Kafka event consumer threads shutdown, exiting uncleanly");
-        }
-        executor = null;
-      }
-      super.disconnect();
-    }
-
-    private class KafkaQueueingConsumer implements Runnable
-    {
-      private KafkaStream<byte[],byte[]> stream;
-      private int threadNumber;
-
-      KafkaQueueingConsumer(KafkaStream<byte[],byte[]> stream, int threadNumber) {
-        this.stream = stream;
-        this.threadNumber = threadNumber;
-      }
-
-      public void run() {
-        LOGGER.info("Starting Kafka consuming thread #" + threadNumber);
-        while (getStatusDetails().isEmpty())
-        {
-          if (!isConnected())
-          {
-            try
-            {
-              connectionLock.acquire(); // blocks execution until a connection has been recovered
-            }
-            catch (InterruptedException error)
-            {
-              ; // ignored
-            }
-          }
-          for (ConsumerIterator<byte[], byte[]> it = stream.iterator(); it.hasNext(); )
-          {
-            try
-            {
-              queue.offer(it.next().message(), 100, TimeUnit.MILLISECONDS);
-            }
-            catch (InterruptedException ex)
-            {
-              ; //ignore
-            }
-          }
-        }
-        LOGGER.info("Shutting down Kafka consuming thread #" + threadNumber);
-      }
-    }
+    this.disconnect("");
+    executorService.shutdown();
   }
 }
